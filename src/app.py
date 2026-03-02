@@ -1,97 +1,418 @@
+import websocket
+import requests
+import json
 import time
-from datetime import datetime, timedelta, timezone
+import os
+import hmac
+import hashlib
+import logging
+import threading
+from dotenv import load_dotenv
 
-from delta_rest_client import (
-    DeltaRestClient,
-    create_order_format,
-    round_by_tick_size
-)
+# ================= ENV =================
+load_dotenv()
 
-# ================= CONFIG =================
-API_KEY = "TcwdPNNYGjjgkRW4BRIAnjL7z5TLyJ"
-API_SECRET = "B5ALo5Mh8mgUREB6oGD4oyX3y185oElaz1LoU6Y3X5ZX0s8TvFZcX4YTVToJ"
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("SECRET_KEY")
+
+if not API_KEY or not API_SECRET:
+    raise Exception("API keys missing")
 
 BASE_URL = "https://api.india.delta.exchange"
+WS_URL = "wss://socket.india.delta.exchange"
 
-STRIKE_INTERVAL = 100
-STRIKE_DISTANCE = 500
-ORDER_SIZE = 2
-CHECK_INTERVAL = 5
-PRICE_OFFSET = 100
-MIN_MARK_PRICE = 500
-# =========================================
+# ================= CONFIG =================
+SYMBOLS = ["PAXGUSD", "SLVONUSD"]
 
-delta_client = DeltaRestClient(
-    base_url=BASE_URL,
-    api_key=API_KEY,
-    api_secret=API_SECRET
+LOT_SIZE = {
+    "PAXGUSD": 10,
+    "SLVONUSD": 6
+}
+
+RISE_PERCENT = 3
+TP_PERCENT = 1.5
+TRADE_COOLDOWN = 20
+
+# ================= LOGGING =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-IST = timezone(timedelta(hours=5, minutes=30))
+# ================= STATE =================
+prices = {}
+positions = {}
+product_ids = {}
+open_orders_cache = {}
+last_trade = {}
+last_trigger_price = {}
+active_order_flag = {}
+positions_ready = False
 
-# ---------- HELPERS ----------
+lock = threading.Lock()
 
-def get_expiry():
-    expiry = datetime(2026, 4, 24)
-    return expiry.strftime("%d%m%y")
+for s in SYMBOLS:
+    prices[s] = None
+    positions[s] = None
+    open_orders_cache[s] = []
+    last_trade[s] = 0
+    last_trigger_price[s] = None
+    active_order_flag[s] = False
 
+# ================= SIGNATURE =================
+def generate_signature(method, path, query="", body=""):
+    timestamp = str(int(time.time()))
+    message = method + timestamp + path + query + body
+    signature = hmac.new(
+        API_SECRET.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return signature, timestamp
 
-def get_atm_strike(spot):
-    return int(round(float(spot) / STRIKE_INTERVAL) * STRIKE_INTERVAL)
+# ================= LOAD PRODUCTS =================
+def load_products():
+    print("Loading product IDs...")
+    for sym in SYMBOLS:
+        r = requests.get(f"{BASE_URL}/v2/products/{sym}")
+        product_ids[sym] = r.json()["result"]["id"]
+    print("Loaded:", product_ids)
 
+# ================= SYNC POSITIONS =================
+def sync_positions():
+    global positions_ready
 
-def get_product_id(symbol):
-    return delta_client.get_product(symbol)["id"]
+    signature, timestamp = generate_signature("GET", "/v2/positions/margined")
 
+    headers = {
+        "api-key": API_KEY,
+        "timestamp": timestamp,
+        "signature": signature
+    }
 
-def position_exists(product_id):
-    pos = delta_client.get_position(product_id)
-    if not pos:
+    r = requests.get(BASE_URL + "/v2/positions/margined", headers=headers)
+
+    if r.status_code == 200:
+        data = r.json().get("result", [])
+
+        for s in SYMBOLS:
+            positions[s] = None
+
+        for pos in data:
+            for sym in SYMBOLS:
+                if product_ids[sym] == pos["product_id"]:
+                    positions[sym] = pos
+
+    positions_ready = True
+
+# ================= POSITION SAFETY SYNC =================
+def periodic_position_sync():
+    while True:
+        time.sleep(30)
+        sync_positions()
+
+# ================= OPEN ORDER CACHE =================
+def fetch_open_orders_loop():
+    while True:
+        try:
+            query = "?state=open"
+            signature, timestamp = generate_signature("GET", "/v2/orders", query)
+
+            headers = {
+                "api-key": API_KEY,
+                "timestamp": timestamp,
+                "signature": signature
+            }
+
+            r = requests.get(BASE_URL + "/v2/orders?state=open", headers=headers)
+
+            if r.status_code == 200:
+                data = r.json().get("result", [])
+
+                for sym in SYMBOLS:
+                    open_orders_cache[sym] = [
+                        o for o in data
+                        if o["product_id"] == product_ids[sym]
+                        and o["side"] == "buy"
+                        and o["reduce_only"] is True
+                        and o["state"] in ["open", "pending"]
+                    ]
+
+        except Exception as e:
+            print("Order fetch error:", e)
+
+        time.sleep(8)
+
+# ================= GET HIGHEST OPEN BUY =================
+def get_highest_open_buy(sym):
+    orders = open_orders_cache.get(sym, [])
+    prices_list = [
+        float(o["limit_price"])
+        for o in orders
+        if o.get("limit_price")
+    ]
+    return max(prices_list) if prices_list else None
+
+# ================= PLACE SHORT =================
+def place_short(sym):
+
+    product_id = product_ids[sym]
+    lot = LOT_SIZE[sym]
+    entry = prices[sym]
+
+    if entry is None:
         return False
-    return abs(float(pos.get("size", 0))) > 0
 
+    tp_price = round(entry * (1 - TP_PERCENT / 100), 2)
 
-# ---------- MAIN ----------
-print("🚀 CALL OPTION BUY BOT STARTED")
+    body_data = {
+        "product_id": product_id,
+        "size": lot,
+        "side": "sell",
+        "order_type": "market_order",
+        "time_in_force": "ioc",
+        "bracket_take_profit_price": str(tp_price),
+        "bracket_take_profit_limit_price": str(tp_price),
+        "reduce_only": False
+    }
 
-while True:
-    try:
-        expiry = get_expiry()
+    body = json.dumps(body_data, separators=(',', ':'))
+    signature, timestamp = generate_signature("POST", "/v2/orders", "", body)
 
-        btc = delta_client.get_ticker("ETHUSD")
-        spot = float(btc["spot_price"])
-        atm = get_atm_strike(spot)
+    headers = {
+        "api-key": API_KEY,
+        "timestamp": timestamp,
+        "signature": signature,
+        "Content-Type": "application/json"
+    }
 
-        call_strike = atm - STRIKE_DISTANCE
-        call_symbol = f"C-ETH-{call_strike}-{expiry}"
+    r = requests.post(BASE_URL + "/v2/orders", headers=headers, data=body)
 
-        print(f"\n🔁 Spot {spot} | ATM {atm}")
-        print(f"📌 CALL {call_strike} | Expiry {expiry}")
+    print(f"SHORT {sym} | Entry:{entry} | TP:{tp_price}")
+    print(r.text)
 
-        call_id = get_product_id(call_symbol)
+    if r.status_code == 200 and r.json().get("success"):
+        sync_positions()
+        return True
 
-        if not position_exists(call_id):
-            call_ticker = delta_client.get_ticker(call_symbol)
-            call_mark = float(call_ticker["mark_price"])
+    return False
 
-            if call_mark >= MIN_MARK_PRICE:
-                call_price = round_by_tick_size(call_mark + PRICE_OFFSET, 0.5)
+# ================= TRADE LOGIC =================
+def trade_logic(sym):
 
-                call_order = create_order_format(
-                    product_id=call_id,
-                    size=ORDER_SIZE,
-                    side="buy",
-                    price=call_price
-                )
+    with lock:
 
-                delta_client.batch_create(call_id, [call_order])
-                print(f"✅ CALL BOUGHT | {call_symbol} @ {call_price}")
+        if not positions_ready:
+            return
+
+        if prices[sym] is None:
+            return
+
+        if active_order_flag[sym]:
+            return
+
+        if time.time() - last_trade[sym] < TRADE_COOLDOWN:
+            return
+
+        pos = positions.get(sym)
+
+        # FIRST ENTRY
+        if not pos or float(pos.get("size", 0)) == 0:
+
+            if open_orders_cache[sym]:
+                return
+
+            active_order_flag[sym] = True
+            if place_short(sym):
+                last_trade[sym] = time.time()
+            active_order_flag[sym] = False
+            return
+
+        # LADDER ENTRY
+        highest_buy = get_highest_open_buy(sym)
+        if not highest_buy:
+            return
+
+        trigger = highest_buy * (1 + RISE_PERCENT / 100)
+
+        if last_trigger_price[sym] == trigger:
+            return
+
+        if prices[sym] >= trigger:
+
+            print(f"{sym} Trigger Hit → Averaging")
+
+            active_order_flag[sym] = True
+
+            if place_short(sym):
+                last_trade[sym] = time.time()
+                last_trigger_price[sym] = trigger
+
+            active_order_flag[sym] = False
+
+# ================= DASHBOARD HELPERS =================
+def calculate_next_trigger(sym):
+    highest_buy = get_highest_open_buy(sym)
+
+    if not highest_buy:
+        return None, None, None
+
+    trigger = highest_buy * (1 + RISE_PERCENT / 100)
+
+    if prices[sym] is None:
+        return trigger, None, None
+
+    distance = trigger - prices[sym]
+    percent_left = (distance / prices[sym]) * 100
+
+    return trigger, round(distance, 4), round(percent_left, 4)
+
+def calculate_position_metrics(sym):
+    pos = positions.get(sym)
+    price = prices.get(sym)
+
+    if not pos or not price:
+        return None
+
+    size = float(pos["size"])
+    entry = float(pos["entry_price"])
+
+    direction = "SHORT" if size < 0 else "LONG"
+
+    unrealized = (entry - price) * abs(size) if size < 0 else (price - entry) * abs(size)
+
+    exposure = abs(size) * price
+    position_value = abs(size) * entry
+
+    return {
+        "direction": direction,
+        "size": size,
+        "entry": entry,
+        "unrealized": round(unrealized, 4),
+        "exposure": round(exposure, 4),
+        "position_value": round(position_value, 4)
+    }
+
+# ================= DASHBOARD =================
+def dashboard_loop():
+    while True:
+        time.sleep(5)
+
+        print("\n" * 2)
+        print("=" * 65)
+        print("🔥 DELTA LIVE TRADING DASHBOARD 🔥")
+        print("=" * 65)
+
+        total_unrealized = 0
+        total_exposure = 0
+
+        for sym in SYMBOLS:
+
+            price = prices.get(sym)
+            metrics = calculate_position_metrics(sym)
+
+            print("\n-------------------------------------------------")
+            print(f"SYMBOL: {sym}")
+            print("-------------------------------------------------")
+            print(f"Mark Price: {price}")
+
+            if not metrics:
+                print("Position: None")
+                continue
+
+            trigger, distance, percent_left = calculate_next_trigger(sym)
+            highest_buy = get_highest_open_buy(sym)
+
+            tp_price = round(metrics["entry"] * (1 - TP_PERCENT / 100), 2)
+
+            print(f"Direction        : {metrics['direction']}")
+            print(f"Position Size    : {metrics['size']}")
+            print(f"Entry Price      : {metrics['entry']}")
+            print(f"Take Profit      : {tp_price}")
+            print(f"Unrealized PnL   : {metrics['unrealized']}")
+            print(f"Position Value   : {metrics['position_value']}")
+            print(f"Current Exposure : {metrics['exposure']}")
+            print(f"Highest Open BUY : {highest_buy}")
+
+            if trigger:
+                print(f"Next Trigger     : {round(trigger,4)}")
+                print(f"Distance To Trg  : {distance}")
+                print(f"Trigger % Left   : {percent_left}%")
             else:
-                print(f"⚠️ CALL skipped (mark {call_mark} < {MIN_MARK_PRICE})")
-        else:
-            print("⏭️ CALL position already exists")
+                print("Next Trigger     : None")
 
-    except Exception as e:
-        print("❌ Error:", e)
+            total_unrealized += metrics["unrealized"]
+            total_exposure += metrics["exposure"]
 
-    time.sleep(CHECK_INTERVAL)
+        print("\n=================================================")
+        print("PORTFOLIO SUMMARY")
+        print("=================================================")
+        print(f"Total Unrealized PnL : {round(total_unrealized,4)}")
+        print(f"Total Exposure       : {round(total_exposure,4)}")
+        print("=" * 65)
+
+# ================= WEBSOCKET =================
+def on_open(ws):
+    signature, timestamp = generate_signature("GET", "/live")
+
+    ws.send(json.dumps({
+        "type": "auth",
+        "payload": {
+            "api-key": API_KEY,
+            "signature": signature,
+            "timestamp": timestamp
+        }
+    }))
+
+    time.sleep(1)
+
+    ws.send(json.dumps({
+        "type": "subscribe",
+        "payload": {
+            "channels": [
+                {"name": "v2/ticker", "symbols": SYMBOLS},
+                {"name": "positions"}
+            ]
+        }
+    }))
+
+def on_message(ws, message):
+    data = json.loads(message)
+
+    if "symbol" in data and "mark_price" in data:
+        sym = data["symbol"]
+        if sym in SYMBOLS:
+            prices[sym] = float(data["mark_price"])
+            trade_logic(sym)
+        return
+
+    if data.get("type") == "positions":
+        for p in data.get("result", []):
+            for sym in SYMBOLS:
+                if product_ids[sym] == p["product_id"]:
+                    positions[sym] = p
+
+def start_ws():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message
+            )
+            ws.run_forever()
+        except Exception as e:
+            print("WS Error:", e)
+            time.sleep(5)
+
+# ================= MAIN =================
+if __name__ == "__main__":
+
+    load_products()
+    sync_positions()
+
+    threading.Thread(target=fetch_open_orders_loop, daemon=True).start()
+    threading.Thread(target=periodic_position_sync, daemon=True).start()
+    threading.Thread(target=dashboard_loop, daemon=True).start()
+
+    start_ws()
