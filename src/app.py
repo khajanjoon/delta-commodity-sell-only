@@ -163,7 +163,9 @@ def place_short(sym):
     if entry is None:
         return False
 
-    tp_price = round(entry * (1 - TP_PERCENT / 100), 2)
+    # =========================
+    # 1️⃣ PLACE MARKET SHORT
+    # =========================
 
     body_data = {
         "product_id": product_id,
@@ -171,8 +173,6 @@ def place_short(sym):
         "side": "sell",
         "order_type": "market_order",
         "time_in_force": "ioc",
-        "bracket_take_profit_price": str(tp_price),
-        "bracket_take_profit_limit_price": str(tp_price),
         "reduce_only": False
     }
 
@@ -188,14 +188,51 @@ def place_short(sym):
 
     r = requests.post(BASE_URL + "/v2/orders", headers=headers, data=body)
 
-    print(f"SHORT {sym} | Entry:{entry} | TP:{tp_price}")
+    print(f"SHORT {sym} | Entry:{entry}")
     print(r.text)
 
-    if r.status_code == 200 and r.json().get("success"):
-        sync_positions()
-        return True
+    if not (r.status_code == 200 and r.json().get("success")):
+        return False
 
-    return False
+    # Small delay to allow position update
+    time.sleep(1)
+    sync_positions()
+
+    # =========================
+    # 2️⃣ PLACE TP REDUCE ONLY
+    # =========================
+
+    pos = positions.get(sym)
+    if not pos:
+        return False
+
+    size = abs(float(pos["size"]))
+    avg_entry = float(pos["entry_price"])
+
+    tp_price = round(avg_entry * (1 - TP_PERCENT / 100), 2)
+
+    tp_body = {
+        "product_id": product_id,
+        "size": size,
+        "side": "buy",
+        "order_type": "limit_order",
+        "limit_price": str(tp_price),
+        "time_in_force": "gtc",
+        "reduce_only": True
+    }
+
+    tp_body_json = json.dumps(tp_body, separators=(',', ':'))
+    signature, timestamp = generate_signature("POST", "/v2/orders", "", tp_body_json)
+
+    headers["timestamp"] = timestamp
+    headers["signature"] = signature
+
+    r2 = requests.post(BASE_URL + "/v2/orders", headers=headers, data=tp_body_json)
+
+    print(f"TP ORDER {sym} | Price:{tp_price}")
+    print(r2.text)
+
+    return True
 
 # ================= TRADE LOGIC =================
 def trade_logic(sym):
